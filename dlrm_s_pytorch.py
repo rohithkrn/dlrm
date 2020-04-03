@@ -64,9 +64,8 @@ import dlrm_data_pytorch as dp
 
 # numpy
 import numpy as np
-
 # onnx
-import onnx
+#import onnx
 
 # pytorch
 import torch
@@ -477,6 +476,11 @@ if __name__ == "__main__":
     parser.add_argument("--save-model", type=str, default="")
     parser.add_argument("--load-model", type=str, default="")
     parser.add_argument("--num-warmup-iters", type=int, default=10)
+
+    parser.add_argument('--use-rocpyx', type=int, required=False, default=1, help="Use rocpyx mpt training")
+    parser.add_argument('--accel-mode', type=str, required=False, default='fp32_fp16', help="Use acceleration mode when using rocpyx. Possible values: fp32, fp32_fp16, fp32_bfp16")
+    parser.add_argument('--loss-scale-value', type=float, required=False, default=1, help="Use loss scaling parameter for MPT")
+
     args = parser.parse_args()
 
     ### some basic setup ###
@@ -689,7 +693,28 @@ if __name__ == "__main__":
         dlrm = dlrm.to(device)  # .cuda()
         if dlrm.ndevices > 1:
             dlrm.emb_l = dlrm.create_emb(m_spa, ln_emb, dlrm.ndevices)
-  
+    
+    if args.use_rocpyx:
+        import rocpyx
+        from rocpyx.mpt import types
+        from rocpyx.mpt import mpt as tt
+
+        trainer = tt.MixedPrecisionTrainer()
+        scale_mode = types.mpt_loss_scale_mode.scale_mode_static
+        scale_handler = types.mpt_loss_scale_handler(scale_mode, args.loss_scale_value)
+        if args.accel_mode == 'fp32':
+            print ("INFO: Using rocpyx with Fp32 mode.")
+            dlrm, param_copy = trainer.prepare_network(dlrm, types.mpt_acceleration_mode.fp32, scale_handler)
+        elif args.accel_mode == 'fp32_fp16':
+            print ("INFO: Using rocpyx with FP32_fp16 mode.")
+            dlrm, param_copy = trainer.prepare_network(dlrm, types.mpt_acceleration_mode.fp32_fp16, scale_handler)
+        elif args.accel_mode == 'fp32_bfp16':
+            print ("INFO: Using rocpyx with FP32_BFP16 mode.")
+            dlrm, param_copy = trainer.prepare_network(dlrm, types.mpt_acceleration_mode.fp32_bfp16, scale_handler)
+        else:
+            print ("ERROR: Unsupported acceleration mode : {}".format(args.accel_mode))
+            sys.exit(1)
+
     # specify the loss function
     if args.loss_function == "mse":
         loss_fn = torch.nn.MSELoss(reduction="mean")
@@ -700,7 +725,14 @@ if __name__ == "__main__":
 
     if not args.inference_only:
         # specify the optimizer algorithm
-        optimizer = torch.optim.SGD(dlrm.parameters(), lr=args.learning_rate)
+        #optimizer = torch.optim.SGD(dlrm.parameters(), lr=args.learning_rate)
+        optimizer = torch.optim.SGD(param_copy, lr=args.learning_rate,)
+
+    global scale_handle
+    if args.use_rocpyx and ((args.accel_mode == 'fp32_fp16') or (args.accel_mode == 'fp32_bfp16')):
+        scale_handle = trainer.scale_loss(optimizer, param_copy)
+    else:
+        scale_handle = None
 
     ### main loop ###
     def time_wrap(use_gpu):
@@ -716,6 +748,11 @@ if __name__ == "__main__":
                 else [lS_i[i].to(i % ndevices) for i in range(len(dlrm.emb_l))]
             lS_o = [S_o.to(i % ndevices) for i,S_o in enumerate(lS_o)] if isinstance(lS_o, list) \
                 else [lS_o[i].to(i % ndevices) for i in range(len(dlrm.emb_l))]
+            if args.accel_mode == 'fp32_bfp16':
+                X = X.bfloat16()
+            if args.accel_mode == 'fp32_fp16':
+                X = X.half()
+
             return dlrm(
                 X.to(device),
                 lS_o,
@@ -725,6 +762,11 @@ if __name__ == "__main__":
             return dlrm(X, lS_o, lS_i)
 
     def loss_fn_wrap(Z, T, use_gpu, device, ndevices):
+        if args.accel_mode == 'fp32_bfp16':
+            T = T.bfloat16()
+        if args.accel_mode == 'fp32_fp16':
+            T = T.half()
+
         if use_gpu:
             if not args.emulate_8_gpu:
                 return loss_fn(Z, T.to(device))
@@ -826,10 +868,10 @@ if __name__ == "__main__":
                 print(E.detach().cpu().numpy())
                 '''
                 # compute loss and accuracy
-                L = E.detach().cpu().numpy()  # numpy array
-                S = Z.detach().cpu().numpy()  # numpy array
+                L = E.detach().cpu().float().numpy()  # numpy array
+                S = Z.detach().cpu().float().numpy()  # numpy array
                 if not args.emulate_8_gpu:
-                    T = T.detach().cpu().numpy()  # numpy array
+                    T = T.detach().cpu().float().numpy()  # numpy array
                 else:
                     T = T[:int(dlrm.ndevices * T.size(0)/8)].detach().cpu().numpy()  # numpy array
                 mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
@@ -838,16 +880,26 @@ if __name__ == "__main__":
                 if not args.inference_only:
                     # scaled error gradient propagation
                     # (where we do not accumulate gradients across mini-batches)
-                    optimizer.zero_grad()
+                    #optimizer.zero_grad()
                     # backward pass
-                    E.backward()
+                    #E.backward()
                     # debug prints (check gradient norm)
                     # for l in mlp.layers:
                     #     if hasattr(l, 'weight'):
                     #          print(l.weight.grad.norm().item())
 
                     # optimizer
-                    optimizer.step()
+                    #optimizer.step()
+                    if args.use_rocpyx and (args.accel_mode == 'fp32_fp16'):
+                        loss, param_copy = scale_handle.backward(E)
+                    elif args.use_rocpyx and (args.accel_mode == 'fp32_bfp16'):
+                        loss, param_copy = scale_handle.backward_bfp16(E)
+                    else:
+                        # compute gradient and do SGD step
+                        optimizer.zero_grad()
+                        E.backward()
+                        optimizer.step()
+
 
                 t2 = time_wrap(use_gpu)
                 total_time += t2 - t1
@@ -882,7 +934,7 @@ if __name__ == "__main__":
                         )
                         + "{:.2f} ms/it, loss {:.6f}, accuracy {:3.3f} %".format(
                             gT, gL, gA * 100
-                        )
+                        ), flush=True,
                     )
                     # Uncomment the line below to print out the total time with overhead
                     # print("Accumulated time so far: {}" \
@@ -910,12 +962,12 @@ if __name__ == "__main__":
                         E_test = loss_fn_wrap(Z_test, T_test, use_gpu, device, dlrm.ndevices)
 
                         # compute loss and accuracy
-                        L_test = E_test.detach().cpu().numpy()  # numpy array
-                        S_test = Z_test.detach().cpu().numpy()  # numpy array
+                        L_test = E_test.detach().cpu().float().numpy()  # numpy array
+                        S_test = Z_test.detach().cpu().float().numpy()  # numpy array
                         if not args.emulate_8_gpu:
-                            T_test = T_test.detach().cpu().numpy()  # numpy array
+                            T_test = T_test.detach().cpu().float().numpy()  # numpy array
                         else:
-                            T_test = T_test[:int(dlrm.ndevices * T_test.size(0)/8)].detach().cpu().numpy()  # numpy array
+                            T_test = T_test[:int(dlrm.ndevices * T_test.size(0)/8)].detach().cpu().float().numpy()  # numpy array
                         mbs_test = T_test.shape[
                             0
                         ]  # = args.mini_batch_size except maybe for last
